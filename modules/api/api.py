@@ -9,7 +9,7 @@ import requests
 import gradio as gr
 from threading import Lock
 from io import BytesIO
-from fastapi import APIRouter, Depends, FastAPI, Request, Response
+from fastapi import APIRouter, Depends, FastAPI, Request, Response, Header
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.exceptions import HTTPException
 from fastapi.responses import JSONResponse
@@ -27,10 +27,11 @@ from PIL import PngImagePlugin, Image
 from modules.sd_models_config import find_checkpoint_config_near_filename
 from modules.realesrgan_model import get_realesrgan_models
 from modules import devices
-from typing import Any
+from typing import Any, Annotated, Union, Dict
 import piexif
 import piexif.helper
 from contextlib import closing
+from concurrent.futures import ThreadPoolExecutor
 
 
 def script_name_to_index(name, scripts):
@@ -207,13 +208,17 @@ class Api:
         self.router = APIRouter()
         self.app = app
         self.queue_lock = queue_lock
+        self.executor = ThreadPoolExecutor(max_workers=4)
+        self.callback_url = 'https://api.auto-pai.cn/aiImage/api/admin/sdimage/drawNotice'
+        self.current_sd_req_id = None
         api_middleware(self.app)
-        self.add_api_route("/sdapi/v1/txt2img", self.text2imgapi, methods=["POST"], response_model=models.TextToImageResponse)
-        self.add_api_route("/sdapi/v1/img2img", self.img2imgapi, methods=["POST"], response_model=models.ImageToImageResponse)
+        self.add_api_route("/sdapi/v1/txt2img", self.text2imgapi, methods=["POST"], response_model=Union[models.TextToImageResponse, Dict])
+        self.add_api_route("/sdapi/v1/img2img", self.img2imgapi, methods=["POST"], response_model=Union[models.ImageToImageResponse, Dict])
         self.add_api_route("/sdapi/v1/extra-single-image", self.extras_single_image_api, methods=["POST"], response_model=models.ExtrasSingleImageResponse)
         self.add_api_route("/sdapi/v1/extra-batch-images", self.extras_batch_images_api, methods=["POST"], response_model=models.ExtrasBatchImagesResponse)
         self.add_api_route("/sdapi/v1/png-info", self.pnginfoapi, methods=["POST"], response_model=models.PNGInfoResponse)
         self.add_api_route("/sdapi/v1/progress", self.progressapi, methods=["GET"], response_model=models.ProgressResponse)
+        self.add_api_route("/sdapi/v1/lineup", self.lineupapi, methods=["GET"], response_model=Dict)
         self.add_api_route("/sdapi/v1/interrogate", self.interrogateapi, methods=["POST"])
         self.add_api_route("/sdapi/v1/interrupt", self.interruptapi, methods=["POST"])
         self.add_api_route("/sdapi/v1/skip", self.skip, methods=["POST"])
@@ -241,7 +246,7 @@ class Api:
         self.add_api_route("/sdapi/v1/reload-checkpoint", self.reloadapi, methods=["POST"])
         self.add_api_route("/sdapi/v1/scripts", self.get_scripts_list, methods=["GET"], response_model=models.ScriptsList)
         self.add_api_route("/sdapi/v1/script-info", self.get_script_info, methods=["GET"], response_model=list[models.ScriptInfo])
-        self.add_api_route("/sdapi/v1/extensions", self.get_extensions_list, methods=["GET"], response_model=list[models.ExtensionItem])
+        # self.add_api_route("/sdapi/v1/extensions", self.get_extensions_list, methods=["GET"], response_model=list[models.ExtensionItem])
 
         if shared.cmd_opts.api_server_stop:
             self.add_api_route("/sdapi/v1/server-kill", self.kill_webui, methods=["POST"])
@@ -335,7 +340,14 @@ class Api:
                         script_args[alwayson_script.args_from + idx] = request.alwayson_scripts[alwayson_script_name]["args"][idx]
         return script_args
 
-    def text2imgapi(self, txt2imgreq: models.StableDiffusionTxt2ImgProcessingAPI):
+    def text2imgapi(self,txt2imgreq: models.StableDiffusionTxt2ImgProcessingAPI, sd_req_id: Union[str, None] = Header(default=None)):
+        if not sd_req_id:
+            raise Exception(f'header [sd-req-id] must not null ')
+
+        if self.current_sd_req_id == sd_req_id:
+            # current id request is already running
+            raise Exception(f'current sd_req_id({sd_req_id}) is already running')
+        
         script_runner = scripts.scripts_txt2img
         if not script_runner.scripts:
             script_runner.initialize_scripts(False)
@@ -362,7 +374,7 @@ class Api:
         send_images = args.pop('send_images', True)
         args.pop('save_images', None)
 
-        with self.queue_lock:
+        def _txt2img():
             with closing(StableDiffusionProcessingTxt2Img(sd_model=shared.sd_model, **args)) as p:
                 p.is_api = True
                 p.scripts = script_runner
@@ -377,15 +389,49 @@ class Api:
                     else:
                         p.script_args = tuple(script_args) # Need to pass args as tuple here
                         processed = process_images(p)
+                    return processed
                 finally:
                     shared.state.end()
                     shared.total_tqdm.clear()
 
-        b64images = list(map(encode_pil_to_base64, processed.images)) if send_images else []
+        def wait_and_run(event):
+            event.wait()
+            self.queue_lock.acquire()
+            try:
+                self.current_sd_req_id = sd_req_id
+                print(f'current_sd_req_id is:{self.current_sd_req_id}')
+                processed = _txt2img()
+            finally:
+               self.queue_lock.release() 
+            b64images = list(map(encode_pil_to_base64, processed.images)) if send_images else []
+            data = models.TextToImageResponse(images=b64images, parameters=vars(txt2imgreq), info=processed.js())
+            requests.post(self.callback_url, data=data, headers={'sd-req-id' : sd_req_id})
+            print('exec callback success')
 
-        return models.TextToImageResponse(images=b64images, parameters=vars(txt2imgreq), info=processed.js())
 
-    def img2imgapi(self, img2imgreq: models.StableDiffusionImg2ImgProcessingAPI):
+        acquired = self.queue_lock.acquire(blocking=False,uni_id=sd_req_id)
+        if acquired == True:
+            try:
+                self.current_sd_req_id = sd_req_id
+                print(f'current_sd_req_id is:{self.current_sd_req_id}')
+                processed = _txt2img()
+            finally:
+               self.queue_lock.release() 
+            b64images = list(map(encode_pil_to_base64, processed.images)) if send_images else []
+            return models.TextToImageResponse(images=b64images, parameters=vars(txt2imgreq), info=processed.js())
+        else:
+            index, event = acquired
+            self.executor.submit(wait_and_run, event)
+            return {'requestId':sd_req_id,'waitNum':index,'ordinal':index}
+
+    def img2imgapi(self, img2imgreq: models.StableDiffusionImg2ImgProcessingAPI, sd_req_id: Union[str, None] = Header(default=None)):
+        if not sd_req_id:
+            raise Exception(f'header [sd-req-id] must not null ')
+        
+        if self.current_sd_req_id == sd_req_id:
+            # current id request is already running
+            raise Exception(f'current sd_req_id({sd_req_id}) is already running')
+
         init_images = img2imgreq.init_images
         if init_images is None:
             raise HTTPException(status_code=404, detail="Init image not found")
@@ -422,7 +468,7 @@ class Api:
         send_images = args.pop('send_images', True)
         args.pop('save_images', None)
 
-        with self.queue_lock:
+        def _img2img():
             with closing(StableDiffusionProcessingImg2Img(sd_model=shared.sd_model, **args)) as p:
                 p.init_images = [decode_base64_to_image(x) for x in init_images]
                 p.is_api = True
@@ -442,14 +488,41 @@ class Api:
                     shared.state.end()
                     shared.total_tqdm.clear()
 
-        b64images = list(map(encode_pil_to_base64, processed.images)) if send_images else []
+        def wait_and_run(event):
+            event.wait()
+            self.queue_lock.acquire()
+            try:
+                self.current_sd_req_id = sd_req_id
+                print(f'current_sd_req_id is:{self.current_sd_req_id}')
+                processed = _img2img()
+            finally:
+               self.queue_lock.release() 
+            b64images = list(map(encode_pil_to_base64, processed.images)) if send_images else []
+            if not img2imgreq.include_init_images:
+                img2imgreq.init_images = None
+                img2imgreq.mask = None
+            data = models.ImageToImageResponse(images=b64images, parameters=vars(img2imgreq), info=processed.js())
+            requests.post(self.callback_url, data=data, headers={'sd-req-id' : sd_req_id})
+            print('exec callback success')
 
-        if not img2imgreq.include_init_images:
-            img2imgreq.init_images = None
-            img2imgreq.mask = None
-
-        return models.ImageToImageResponse(images=b64images, parameters=vars(img2imgreq), info=processed.js())
-
+        acquired = self.queue_lock.acquire(blocking=False, uni_id=sd_req_id)
+        if acquired == True:
+            try:
+                self.current_sd_req_id = sd_req_id
+                print(f'current_sd_req_id is:{self.current_sd_req_id}')
+                processed = _img2img()
+            finally:
+               self.queue_lock.release() 
+            b64images = list(map(encode_pil_to_base64, processed.images)) if send_images else []
+            if not img2imgreq.include_init_images:
+                img2imgreq.init_images = None
+                img2imgreq.mask = None
+            return models.ImageToImageResponse(images=b64images, parameters=vars(img2imgreq), info=processed.js())
+        else:
+            index, event = acquired
+            self.executor.submit(wait_and_run, event)
+            return {'requestId':sd_req_id,'waitNum':index,'ordinal':index}
+            
     def extras_single_image_api(self, req: models.ExtrasSingleImageRequest):
         reqDict = setUpscalers(req)
 
@@ -485,10 +558,12 @@ class Api:
 
         return models.PNGInfoResponse(info=geninfo, items=items, parameters=params)
 
-    def progressapi(self, req: models.ProgressRequest = Depends()):
-        # copy from check_progress_call of ui.py
+    def progressapi(self, req: models.ProgressRequest = Depends(), sd_req_id: Union[str, None] = Header(default=None)):
+        if not sd_req_id:
+            raise Exception(f'header [sd-req-id] must not null ')
 
-        if shared.state.job_count == 0:
+        # copy from check_progress_call of ui.py
+        if shared.state.job_count == 0 or self.current_sd_req_id != sd_req_id:
             return models.ProgressResponse(progress=0, eta_relative=0, state=shared.state.dict(), textinfo=shared.state.textinfo)
 
         # avoid dividing zero
@@ -512,6 +587,19 @@ class Api:
             current_image = encode_pil_to_base64(shared.state.current_image)
 
         return models.ProgressResponse(progress=progress, eta_relative=eta_relative, state=shared.state.dict(), current_image=current_image, textinfo=shared.state.textinfo)
+
+    def lineupapi(self, sd_req_id: Union[str, None] = Header(default=None)):
+        '''
+          return the lineup order 
+        '''
+        if not sd_req_id:
+            raise Exception(f'header [sd-req-id] must not null ')
+
+        index, count = self.queue_lock.get_index(sd_req_id)
+        if self.current_sd_req_id == sd_req_id:
+             index = 0
+
+        return {'requestId':sd_req_id, 'waitNum': count, 'ordinal': index}
 
     def interrogateapi(self, interrogatereq: models.InterrogateRequest):
         image_b64 = interrogatereq.image
