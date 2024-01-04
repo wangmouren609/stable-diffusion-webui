@@ -68,7 +68,7 @@ class UidLock(FIFOLock):
 
     def get_index(self,uni_id):
         with self._inner_lock:
-            self._get_index(uni_id)
+            return self._get_index(uni_id)
         
     def _get_index(self,uni_id):
         for index,tup in enumerate(self._pending_threads):
