@@ -11,7 +11,7 @@ def is_health():
     if cuda['events']['oom'] > 0 :
         # service is already oom 
         print('service is already oom ')
-        progress = requests.get('http://localhost:7860/sdapi/v1/progress').json()
+        progress = requests.get('http://localhost:7860/sdapi/v1/progress',headers={'sd-req-id':'health-check'}).json()
         is_idel = progress['state']['job_count'] ==0
         if is_idel and cuda['system']['free'] < 1572864000:
             print('service is is_idel but free cuda memory is to low ,service is not health')
